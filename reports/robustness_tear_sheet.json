@@ -1,0 +1,136 @@
+{
+    "monte_carlo": {
+        "n_simulations": 2500,
+        "median_return_pct": 116.23,
+        "return_5th_pct": 84.98,
+        "return_95th_pct": 148.52,
+        "median_max_dd_pct": -4.16,
+        "max_dd_95th_pct": -7.2,
+        "max_dd_99th_pct": -9.06,
+        "prob_dd_exceeds_5pct": 27.44,
+        "prob_dd_exceeds_10pct": 0.48,
+        "prob_ruin_50pct": 0.0
+    },
+    "friction_sensitivity": [
+        {
+            "spread_pips": 0.6,
+            "slippage_pips": 0.2,
+            "total_friction_pips": 0.8,
+            "total_return_pct": 130.01,
+            "sharpe_ratio": 6.85,
+            "max_drawdown_pct": -4.11,
+            "win_rate_pct": 78.05,
+            "profit_factor": 2.2,
+            "expectancy_usd": 214.53,
+            "total_trades": 606
+        },
+        {
+            "spread_pips": 0.8,
+            "slippage_pips": 0.2,
+            "total_friction_pips": 1.0,
+            "total_return_pct": 116.85,
+            "sharpe_ratio": 6.44,
+            "max_drawdown_pct": -4.11,
+            "win_rate_pct": 77.37,
+            "profit_factor": 2.09,
+            "expectancy_usd": 194.43,
+            "total_trades": 601
+        },
+        {
+            "spread_pips": 1.2,
+            "slippage_pips": 0.2,
+            "total_friction_pips": 1.4,
+            "total_return_pct": 101.47,
+            "sharpe_ratio": 5.8,
+            "max_drawdown_pct": -4.11,
+            "win_rate_pct": 75.0,
+            "profit_factor": 1.91,
+            "expectancy_usd": 173.74,
+            "total_trades": 584
+        },
+        {
+            "spread_pips": 1.5,
+            "slippage_pips": 0.2,
+            "total_friction_pips": 1.7,
+            "total_return_pct": 98.37,
+            "sharpe_ratio": 5.65,
+            "max_drawdown_pct": -3.39,
+            "win_rate_pct": 74.27,
+            "profit_factor": 1.88,
+            "expectancy_usd": 169.89,
+            "total_trades": 579
+        },
+        {
+            "spread_pips": 2.0,
+            "slippage_pips": 0.2,
+            "total_friction_pips": 2.2,
+            "total_return_pct": 67.84,
+            "sharpe_ratio": 4.34,
+            "max_drawdown_pct": -4.05,
+            "win_rate_pct": 71.03,
+            "profit_factor": 1.61,
+            "expectancy_usd": 118.39,
+            "total_trades": 573
+        },
+        {
+            "spread_pips": 2.5,
+            "slippage_pips": 0.2,
+            "total_friction_pips": 2.7,
+            "total_return_pct": 49.86,
+            "sharpe_ratio": 3.43,
+            "max_drawdown_pct": -5.33,
+            "win_rate_pct": 69.28,
+            "profit_factor": 1.45,
+            "expectancy_usd": 87.01,
+            "total_trades": 573
+        }
+    ],
+    "risk_sizing_sensitivity": [
+        {
+            "risk_pct_per_trade": 0.25,
+            "total_return_pct": 47.55,
+            "sharpe_ratio": 6.44,
+            "max_drawdown_pct": -2.07,
+            "profit_factor": 2.12,
+            "calmar_ratio": 22.92,
+            "final_capital": 147548.89
+        },
+        {
+            "risk_pct_per_trade": 0.5,
+            "total_return_pct": 116.85,
+            "sharpe_ratio": 6.44,
+            "max_drawdown_pct": -4.11,
+            "profit_factor": 2.09,
+            "calmar_ratio": 28.42,
+            "final_capital": 216850.41
+        },
+        {
+            "risk_pct_per_trade": 0.75,
+            "total_return_pct": 217.46,
+            "sharpe_ratio": 6.44,
+            "max_drawdown_pct": -6.11,
+            "profit_factor": 2.04,
+            "calmar_ratio": 35.58,
+            "final_capital": 317456.39
+        },
+        {
+            "risk_pct_per_trade": 1.0,
+            "total_return_pct": 362.93,
+            "sharpe_ratio": 6.44,
+            "max_drawdown_pct": -8.08,
+            "profit_factor": 2.0,
+            "calmar_ratio": 44.94,
+            "final_capital": 462933.28
+        },
+        {
+            "risk_pct_per_trade": 1.5,
+            "total_return_pct": 767.57,
+            "sharpe_ratio": 6.59,
+            "max_drawdown_pct": -8.51,
+            "profit_factor": 2.04,
+            "calmar_ratio": 90.2,
+            "final_capital": 867569.6
+        }
+    ],
+    "max_tolerable_friction_pips": 2.7
+}

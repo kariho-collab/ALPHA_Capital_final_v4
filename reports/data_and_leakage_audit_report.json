@@ -1,0 +1,29 @@
+{
+    "timestamp": "2026-11-15T14:06:08.344957+00:00",
+    "data_integrity": {
+        "m1_index_monotonic_increasing": true,
+        "ltf_index_monotonic_increasing": true,
+        "m1_duplicate_timestamps": 0,
+        "ltf_duplicate_timestamps": 0,
+        "m1_null_count": 0,
+        "ltf_null_count": 0,
+        "price_coherence_high_ge_low": true,
+        "price_coherence_high_ge_open_close": true,
+        "price_coherence_low_le_open_close": true,
+        "volume_all_positive": true,
+        "unexpected_weekday_gaps_count": 156,
+        "passed": true
+    },
+    "leakage_audit": {
+        "leaked_targets_in_features": [],
+        "target_isolation_passed": true,
+        "leaked_future_prices_in_features": [],
+        "future_price_isolation_passed": true,
+        "mtf_strict_t_minus_1_lag_verified": true,
+        "regime_strict_t_minus_1_lag_verified": true,
+        "corr_target_delta_with_bar0_ret": 0.0714,
+        "zero_instantaneous_target_leakage": true,
+        "passed": true
+    },
+    "overall_audit_passed": true
+}

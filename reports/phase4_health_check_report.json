@@ -1,0 +1,10 @@
+{
+    "timestamp": "2026-11-15T16:41:03.629659+00:00",
+    "mt5_available": true,
+    "mt5_connected": false,
+    "all_models_loaded": true,
+    "macro_calendar_events_2026": 68,
+    "cycle_execution_time_ms": 2516.53,
+    "circuit_breakers_active": true,
+    "production_ready": true
+}

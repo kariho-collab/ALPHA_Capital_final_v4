@@ -1,0 +1,28 @@
+{
+    "execution_model": "Next-Bar Open (1-bar latency)",
+    "spread_pips": 0.8,
+    "slippage_pips": 0.2,
+    "commission_per_lot_usd": 3.0,
+    "partitioning": {
+        "train_ratio": 0.6,
+        "val_ratio": 0.2,
+        "test_ratio": 0.2
+    },
+    "results": {
+        "initial_capital": 100000.0,
+        "final_capital": 158634.51,
+        "total_return_pct": 58.63,
+        "max_drawdown_pct": -4.43,
+        "annualized_sharpe": 5.19,
+        "sortino_ratio": 11.85,
+        "calmar_ratio": 13.24,
+        "var_95_pct": -0.519,
+        "cvar_95_expected_shortfall_pct": -1.119,
+        "var_99_pct": -1.035,
+        "cvar_99_expected_shortfall_pct": -1.716,
+        "total_trades": 364,
+        "win_rate_pct": 78.02,
+        "profit_factor": 1.96,
+        "trade_expectancy_usd": 161.08
+    }
+}
