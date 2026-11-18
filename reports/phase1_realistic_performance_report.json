@@ -10,19 +10,19 @@
     },
     "results": {
         "initial_capital": 100000.0,
-        "final_capital": 158634.51,
-        "total_return_pct": 58.63,
-        "max_drawdown_pct": -4.43,
-        "annualized_sharpe": 5.19,
-        "sortino_ratio": 11.85,
-        "calmar_ratio": 13.24,
+        "final_capital": 129005.3,
+        "total_return_pct": 29.01,
+        "max_drawdown_pct": -4.03,
+        "annualized_sharpe": 3.63,
+        "sortino_ratio": 14.72,
+        "calmar_ratio": 7.19,
         "var_95_pct": -0.519,
-        "cvar_95_expected_shortfall_pct": -1.119,
-        "var_99_pct": -1.035,
-        "cvar_99_expected_shortfall_pct": -1.716,
-        "total_trades": 364,
-        "win_rate_pct": 78.02,
-        "profit_factor": 1.96,
-        "trade_expectancy_usd": 161.08
+        "cvar_95_expected_shortfall_pct": -0.715,
+        "var_99_pct": -1.011,
+        "cvar_99_expected_shortfall_pct": -1.035,
+        "total_trades": 243,
+        "win_rate_pct": 76.95,
+        "profit_factor": 1.82,
+        "trade_expectancy_usd": 119.36
     }
 }

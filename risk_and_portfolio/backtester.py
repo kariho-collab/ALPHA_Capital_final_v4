@@ -5,6 +5,7 @@ Simulates trades with institutional execution realism:
 - Dynamic spread, slippage, and round-turn broker commissions ($3.00/lot)
 - Pessimistic intrabar fill resolution (SL before TP on ambiguous bars)
 - Bar-by-bar Mark-to-Market equity tracking (Rule 1: no unrealized loss concealment)
+- Institutional Safeguards: Post-Stop-Loss Cooldown (3 bars / 15m) & Spread Guard (<= 1.5 pips)
 """
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
@@ -32,6 +33,8 @@ class SimulatedTrade:
 class InstitutionalBacktester:
     def __init__(self, config: ResearchConfig = default_config):
         self.config = config
+        self.stop_loss_cooldown_bars: int = 3  # 3 M5 bars (15 minutes) cooldown after SL
+        self.max_allowed_spread_pips: float = 1.5
 
     def run_simulation(
         self,
@@ -41,10 +44,12 @@ class InstitutionalBacktester:
         regime_labels: Optional[Dict[int, str]] = None
     ) -> Dict[str, Any]:
         """
-        Executes event-driven backtest with strict execution realism:
+        Executes event-driven backtest with strict execution realism and live safeguards:
         - Next-bar Open fills (1-bar decision latency)
         - Spread + slippage + turnover commission
         - Dynamic ATR brackets with trailing stop to breakeven + 1 pip
+        - Post-Stop-Loss Cooldown (15 min pause after stop-out)
+        - Spread Guard (aborts entries if spread > 1.5 pips)
         - Continuous bar-by-bar Mark-to-Market equity tracking
         """
         capital = float(self.config.initial_capital)
@@ -55,6 +60,7 @@ class InstitutionalBacktester:
         active_trade: Optional[Dict[str, Any]] = None
         pending_signal: int = 0
         pending_signal_bar: int = -1
+        cooldown_until_bar: int = -1  # Tracks post-stop-loss cooldown state
 
         pip = self.config.pip_size
         cost_pips = self.config.typical_spread_pips + self.config.slippage_pips
@@ -92,56 +98,67 @@ class InstitutionalBacktester:
             # STEP 1: Execute Pending Order on Bar Open (Configurable Execution Latency)
             # -------------------------------------------------------------
             if active_trade is None and pending_signal != 0 and i >= pending_signal_bar + delay_bars:
-                sl_dist_pips = max(atr_val / pip * self.config.atr_stop_mult, 8.0)
-                tp_dist_pips = max(atr_val / pip * self.config.atr_take_profit_mult, 16.0)
-
-                # Position Sizing (Fixed Fractional or Dynamic Inverse-Volatility)
-                if getattr(self.config, "use_dynamic_sizing", False):
-                    from risk_and_portfolio.dynamic_sizer import DynamicPositionSizer
-                    if not hasattr(self, "_dynamic_sizer") or self._dynamic_sizer is None:
-                        self._dynamic_sizer = DynamicPositionSizer(base_risk_pct=self.config.max_risk_per_trade_pct)
-                    reg_name = regime_labels.get(regime_val, "Bullish Momentum Trend") if regime_labels else "Bullish Momentum Trend"
-                    lots = self._dynamic_sizer.calculate_lots(
-                        equity=capital,
-                        stop_loss_pips=sl_dist_pips,
-                        current_atr_pips=atr_arr[i],
-                        regime_label=reg_name
-                    )
+                
+                # Check Spread Guard Circuit Breaker
+                if self.config.typical_spread_pips > self.max_allowed_spread_pips:
+                    # Abort entry due to spread guard
+                    pending_signal = 0
+                    pending_signal_bar = -1
+                elif i < cooldown_until_bar:
+                    # Respect Post-Stop-Loss Cooldown
+                    pending_signal = 0
+                    pending_signal_bar = -1
                 else:
-                    lots = PositionSizer.fixed_fractional(
-                        equity=capital,
-                        risk_pct=self.config.max_risk_per_trade_pct,
-                        stop_loss_pips=sl_dist_pips
-                    )
+                    sl_dist_pips = max(atr_val / pip * self.config.atr_stop_mult, 8.0)
+                    tp_dist_pips = max(atr_val / pip * self.config.atr_take_profit_mult, 16.0)
 
-                # Fill at Bar Open + Spread + Slippage
-                if pending_signal == 1:  # Long
-                    entry_p = open_p + cost_price
-                    sl_p = entry_p - (sl_dist_pips * pip)
-                    tp_p = entry_p + (tp_dist_pips * pip)
-                else:  # Short
-                    entry_p = open_p - cost_price
-                    sl_p = entry_p + (sl_dist_pips * pip)
-                    tp_p = entry_p - (tp_dist_pips * pip)
+                    # Position Sizing (Fixed Fractional or Dynamic Inverse-Volatility)
+                    if getattr(self.config, "use_dynamic_sizing", False):
+                        from risk_and_portfolio.dynamic_sizer import DynamicPositionSizer
+                        if not hasattr(self, "_dynamic_sizer") or self._dynamic_sizer is None:
+                            self._dynamic_sizer = DynamicPositionSizer(base_risk_pct=self.config.max_risk_per_trade_pct)
+                        reg_name = regime_labels.get(regime_val, "Bullish Momentum Trend") if regime_labels else "Bullish Momentum Trend"
+                        lots = self._dynamic_sizer.calculate_lots(
+                            equity=capital,
+                            stop_loss_pips=sl_dist_pips,
+                            current_atr_pips=atr_arr[i],
+                            regime_label=reg_name
+                        )
+                    else:
+                        lots = PositionSizer.fixed_fractional(
+                            equity=capital,
+                            risk_pct=self.config.max_risk_per_trade_pct,
+                            stop_loss_pips=sl_dist_pips
+                        )
 
-                # Deduct entry half-turn commission
-                comm_entry = (comm_per_lot / 2.0) * lots
-                capital -= comm_entry
+                    # Fill at Bar Open + Spread + Slippage
+                    if pending_signal == 1:  # Long
+                        entry_p = open_p + cost_price
+                        sl_p = entry_p - (sl_dist_pips * pip)
+                        tp_p = entry_p + (tp_dist_pips * pip)
+                    else:  # Short
+                        entry_p = open_p - cost_price
+                        sl_p = entry_p + (sl_dist_pips * pip)
+                        tp_p = entry_p - (tp_dist_pips * pip)
 
-                active_trade = {
-                    "entry_time": t,
-                    "entry_bar_idx": i,
-                    "direction": pending_signal,
-                    "entry_price": entry_p,
-                    "stop_loss": sl_p,
-                    "take_profit": tp_p,
-                    "lots": lots,
-                    "comm_entry": comm_entry,
-                    "max_favorable": entry_p,
-                    "min_favorable": entry_p
-                }
-                pending_signal = 0
-                pending_signal_bar = -1
+                    # Deduct entry half-turn commission
+                    comm_entry = (comm_per_lot / 2.0) * lots
+                    capital -= comm_entry
+
+                    active_trade = {
+                        "entry_time": t,
+                        "entry_bar_idx": i,
+                        "direction": pending_signal,
+                        "entry_price": entry_p,
+                        "stop_loss": sl_p,
+                        "take_profit": tp_p,
+                        "lots": lots,
+                        "comm_entry": comm_entry,
+                        "max_favorable": entry_p,
+                        "min_favorable": entry_p
+                    }
+                    pending_signal = 0
+                    pending_signal_bar = -1
 
             # -------------------------------------------------------------
             # STEP 2: Manage Active Trade (Trailing Stop & Exit Evaluation)
@@ -226,6 +243,10 @@ class InstitutionalBacktester:
                     net_pnl_usd = gross_pnl_usd  # commissions already deducted from capital
                     capital += gross_pnl_usd
 
+                    # Trigger Post-Stop-Loss Cooldown if stopped out
+                    if "STOP_LOSS" in reason:
+                        cooldown_until_bar = i + self.stop_loss_cooldown_bars
+
                     trades.append(SimulatedTrade(
                         entry_time=active_trade["entry_time"],
                         direction=d,
@@ -241,21 +262,20 @@ class InstitutionalBacktester:
                     active_trade = None
 
             # -------------------------------------------------------------
-            # STEP 3: Register Signal for Next-Bar Execution (If Flat)
+            # STEP 3: Register Signal for Next-Bar Execution (If Flat & Not in Cooldown)
             # -------------------------------------------------------------
             if active_trade is None and signal_val != 0 and i < n_bars - 1:
-                pending_signal = signal_val
-                pending_signal_bar = i
+                if i >= cooldown_until_bar:
+                    pending_signal = signal_val
+                    pending_signal_bar = i
 
             # -------------------------------------------------------------
             # STEP 4: Mark-to-Market Bar Equity Calculation (Rule 1)
-            # Marks open positions to market on every bar; prevents hidden unrealized loss
             # -------------------------------------------------------------
             if active_trade is not None:
                 d = active_trade["direction"]
                 unrealized_pips = ((close - active_trade["entry_price"]) / pip) if d == 1 else ((active_trade["entry_price"] - close) / pip)
                 unrealized_usd = (unrealized_pips * 10.0) * active_trade["lots"]
-                # Include expected exit commission
                 comm_exit_est = (comm_per_lot / 2.0) * active_trade["lots"]
                 bar_mtm_equity = capital + unrealized_usd - comm_exit_est
             else:

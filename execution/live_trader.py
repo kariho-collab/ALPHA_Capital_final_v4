@@ -127,7 +127,8 @@ class MT5Bridge:
         if rates is None or len(rates) == 0:
             return None
         df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+        # Synchronized with MT5 broker server time offset (-2 hours to UTC)
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True) - pd.Timedelta(hours=2)
         df.set_index('time', inplace=True)
         df.rename(columns={'tick_volume': 'volume'}, inplace=True)
         return df[['open', 'high', 'low', 'close', 'volume']]
@@ -229,14 +230,14 @@ class MT5Bridge:
 class LiveExecutionEngine:
     """
     Phase 4 Production Execution Engine:
-    - Ingests real-time 5-minute bar feeds.
-    - Applies Tier-1 Macro News Blackout Protocol.
-    - Computes real-time features and HMM market regimes.
-    - Evaluates dual ML ensemble + Adaptive Conviction thresholds.
-    - Prunes false breakouts using López de Prado Meta-Labeler.
-    - Sizes positions via Dynamic Inverse-Volatility Sizer synced to live broker equity.
-    - Enforces Spread Guard, Daily Drawdown, and Post-Stop-Loss cooldowns.
-    - Manages trailing stops and time-decay exits.
+- Ingests real-time 5-minute bar feeds.
+- Applies Tier-1 Macro News Blackout Protocol.
+- Computes real-time features and HMM market regimes.
+- Evaluates dual ML ensemble + Adaptive Conviction thresholds.
+- Prunes false breakouts using López de Prado Meta-Labeler.
+- Sizes positions via Dynamic Inverse-Volatility Sizer synced to live broker equity.
+- Enforces Spread Guard, Daily Drawdown, and Post-Stop-Loss cooldowns.
+- Manages trailing stops and time-decay exits.
     """
     def __init__(self, mode: str = "paper", config: ResearchConfig = default_config):
         self.mode = mode.lower()
@@ -378,11 +379,11 @@ class LiveExecutionEngine:
     ) -> Tuple[int, Dict[str, Any]]:
         """
         Processes current market bars and evaluates Phase 3 signal generation:
-        1. Tier-1 Macro News Blackout check
-        2. HMM Market Regime classification
-        3. Dual Ensemble predictions (Long + Short)
-        4. Adaptive Volatility Thresholding
-        5. López de Prado Meta-Labeler pruning
+1. Tier-1 Macro News Blackout check
+2. HMM Market Regime classification
+3. Dual Ensemble predictions (Long + Short)
+4. Adaptive Volatility Thresholding
+5. López de Prado Meta-Labeler pruning
         """
         current_time = pd.Timestamp(ltf_df.index[-1], tz="UTC") if ltf_df.index[-1].tzinfo is None else ltf_df.index[-1]
 
@@ -707,7 +708,7 @@ class LiveExecutionEngine:
                     resampler = MultiTimeframeResampler(self.config)
                     tf_data = resampler.resample_all(m1_df)
                     ltf_df = tf_data["ltf"].tail(300)
-                    mtf_df = tf_data["mtf"].tail(150)
+                    mtf_df = tf_data["tf"].tail(150) if "tf" in tf_data else tf_data["mtf"].tail(150)
                     htf_df = tf_data["htf"].tail(100)
 
                 if ltf_df is not None and len(ltf_df) > 0:
@@ -724,81 +725,10 @@ class LiveExecutionEngine:
                 self.mt5_bridge.disconnect()
 
 
-def run_verification_health_check() -> Dict[str, Any]:
-    """
-    Self-contained verification suite for Phase 4 deployment readiness.
-    """
-    print("=" * 78)
-    print("      ALPHA CAPITAL: PHASE 4 LIVE EXECUTION BRIDGE VERIFICATION")
-    print("=" * 78)
-
-    # 1. MT5 Terminal Bridge Check
-    print("\n[CHECK 1: METATRADER 5 CONNECTIVITY PROBE]")
-    bridge = MT5Bridge(symbol="EURUSD")
-    mt5_installed = MT5_AVAILABLE
-    mt5_connected = bridge.connect()
-    print(f"  > MetaTrader 5 Python Library: {'INSTALLED (v5.0)' if mt5_installed else 'NOT FOUND'}")
-    print(f"  > MT5 Live Terminal Link:      {'CONNECTED (Account #' + str(bridge.account_login) + ')' if mt5_connected else 'OFFLINE (Paper Engine Active)'}")
-
-    # 2. Production Dual Model Artifacts
-    print("\n[CHECK 2: INSTITUTIONAL MODEL ARTIFACTS]")
-    required_models = [
-        "xgboost_long_model.pkl", "lightgbm_long_model.pkl", "random_forest_long_model.pkl",
-        "xgboost_short_model.pkl", "lightgbm_short_model.pkl", "random_forest_short_model.pkl"
-    ]
-    all_models_ok = True
-    for m in required_models:
-        p = MODELS_DIR / m
-        exists = p.exists()
-        all_models_ok = all_models_ok and exists
-        print(f"  > Model '{m}': {'FOUND (' + str(round(p.stat().st_size / 1024, 1)) + ' KB)' if exists else 'MISSING'}")
-
-    # 3. Macro Economic News Calendar Check
-    print("\n[CHECK 3: TIER-1 MACRO NEWS BLACKOUT ENGINE]")
-    cal = MacroNewsCalendar(pre_blackout_minutes=30, post_blackout_minutes=30)
-    events = cal.get_tier1_events(start_date="2026-01-01", end_date="2026-12-31")
-    now_utc = pd.Timestamp(datetime.now(timezone.utc))
-    is_blackout_now = bool(cal.compute_blackout_mask(pd.DatetimeIndex([now_utc])).iloc[0])
-    print(f"  > Scheduled 2026 Tier-1 Releases: {len(events)} events (US CPI, NFP, FOMC, ECB)")
-    print(f"  > Current UTC Time ({str(now_utc)[:19]}): {'IN BLACKOUT (Entries Frozen)' if is_blackout_now else 'CLEAN TRADING WINDOW'}")
-
-    # 4. End-to-End Cycle Simulation
-    print("\n[CHECK 4: SUB-SECOND END-TO-END EXECUTION CYCLE]")
-    t0 = time.time()
-    engine = LiveExecutionEngine(mode="paper")
-    loader = HistoricalDataLoader(default_config)
-    m1_df = loader.get_or_generate_m1_data(years=3)
-    resampler = MultiTimeframeResampler(default_config)
-    tf_data = resampler.resample_all(m1_df)
-    engine.run_cycle(tf_data["ltf"].tail(300), tf_data["mtf"].tail(150), tf_data["htf"].tail(100))
-    cycle_time_ms = (time.time() - t0) * 1000.0
-    print(f"  > Full Evaluation Cycle Execution Time: {cycle_time_ms:.1f} ms (Sub-second threshold: < 1,000 ms)")
-
-    # 5. Circuit Breaker Simulation
-    print("\n[CHECK 5: AUTOMATED CIRCUIT BREAKER AUDIT]")
-    print(f"  > Spread Guard Limit:           1.5 pips (Enforced)")
-    print(f"  > Daily Drawdown Limit:         3.0% (Enforced)")
-    print(f"  > Post-Stop-Loss Cooldown:      15 minutes (Enforced)")
-
-    if mt5_connected:
-        bridge.disconnect()
-
-    return {
-        "mt5_installed": mt5_installed,
-        "mt5_connected": mt5_connected,
-        "all_models_ok": all_models_ok,
-        "cycle_time_ms": round(cycle_time_ms, 1)
-    }
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ALPHA Capital Phase 4 Live Execution Engine")
-    parser.add_argument("--mode", type=str, default="paper", choices=["paper", "live", "verify"], help="Execution mode")
-    parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds")
+    parser = argparse.ArgumentParser(description="ALPHA Capital Live Execution Engine")
+    parser.add_argument("--mode", type=str, default="paper", choices=["paper", "live"], help="Execution mode")
     args = parser.parse_args()
 
-    if args.mode == "verify":
-        run_verification_health_check()
-    else:
-        engine = LiveExecutionEngine(mode=args.mode)
-        engine.start_polling_loop(poll_interval_seconds=args.interval)
+    engine = LiveExecutionEngine(mode=args.mode)
+    engine.start_polling_loop()

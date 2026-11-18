@@ -70,5 +70,17 @@
     "pnl_usd": -324.53,
     "exit_reason": "STOP_LOSS",
     "equity_after": 100765.82
+  },
+  {
+    "entry_time": "2026-11-18T15:10:05.413652+00:00",
+    "exit_time": "2026-11-18T15:35:05.409763+00:00",
+    "direction": "BUY",
+    "entry_price": 1.0975199999999998,
+    "exit_price": 1.09672,
+    "lots": 4.13,
+    "pnl_pips": -8.0,
+    "pnl_usd": -342.79,
+    "exit_reason": "STOP_LOSS",
+    "equity_after": 50416.48
   }
 ]
