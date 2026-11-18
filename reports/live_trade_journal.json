@@ -1,0 +1,74 @@
+[
+  {
+    "entry_time": "2026-11-17T09:30:06.906161+00:00",
+    "exit_time": "2026-11-17T10:30:12.127056+00:00",
+    "direction": "SELL",
+    "entry_price": 1.10037,
+    "exit_price": 1.09952,
+    "lots": 3.73,
+    "pnl_pips": 8.5,
+    "pnl_usd": 305.86,
+    "exit_reason": "TIME_DECAY",
+    "equity_after": 100305.86
+  },
+  {
+    "entry_time": "2026-11-17T13:00:04.042834+00:00",
+    "exit_time": "2026-11-17T13:35:04.466817+00:00",
+    "direction": "SELL",
+    "entry_price": 1.09934,
+    "exit_price": 1.09774,
+    "lots": 4.17,
+    "pnl_pips": 16.0,
+    "pnl_usd": 654.69,
+    "exit_reason": "TAKE_PROFIT",
+    "equity_after": 100960.55
+  },
+  {
+    "entry_time": "2026-11-17T14:00:04.610818+00:00",
+    "exit_time": "2026-11-17T14:10:04.357397+00:00",
+    "direction": "SELL",
+    "entry_price": 1.09824,
+    "exit_price": 1.09904,
+    "lots": 3.61,
+    "pnl_pips": -8.0,
+    "pnl_usd": -299.63,
+    "exit_reason": "STOP_LOSS",
+    "equity_after": 100660.92
+  },
+  {
+    "entry_time": "2026-11-17T14:10:05.601509+00:00",
+    "exit_time": "2026-11-17T15:10:00.938204+00:00",
+    "direction": "SELL",
+    "entry_price": 1.09904,
+    "exit_price": 1.0993,
+    "lots": 3.43,
+    "pnl_pips": -2.6,
+    "pnl_usd": -99.47,
+    "exit_reason": "TIME_DECAY",
+    "equity_after": 100561.45
+  },
+  {
+    "entry_time": "2026-11-18T08:05:02.890688+00:00",
+    "exit_time": "2026-11-18T09:05:04.804056+00:00",
+    "direction": "SELL",
+    "entry_price": 1.09756,
+    "exit_price": 1.09624,
+    "lots": 4.1,
+    "pnl_pips": 13.2,
+    "pnl_usd": 528.9,
+    "exit_reason": "TIME_DECAY",
+    "equity_after": 101090.35
+  },
+  {
+    "entry_time": "2026-11-18T13:05:08.269184+00:00",
+    "exit_time": "2026-11-18T13:40:05.458345+00:00",
+    "direction": "SELL",
+    "entry_price": 1.09646,
+    "exit_price": 1.09726,
+    "lots": 3.91,
+    "pnl_pips": -8.0,
+    "pnl_usd": -324.53,
+    "exit_reason": "STOP_LOSS",
+    "equity_after": 100765.82
+  }
+]

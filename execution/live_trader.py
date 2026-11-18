@@ -14,15 +14,16 @@ Automated Circuit Breakers:
 - Daily Drawdown Kill-Switch: Halts trading if daily loss exceeds 3.0%
 - Time-Decay Exit: Closes position after 12 bars (60 min)
 - Trailing Stop to Breakeven (+1 pip) after 50% TP distance reached
+- Post-Stop-Loss Cooldown: Pauses new entries for 15 minutes (3 bars) after a stop-out
 """
 import argparse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
 import sys
 import time
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -64,7 +65,7 @@ except ImportError:
 class MT5Bridge:
     """
     Direct interface to MetaTrader 5 terminal for order placement,
-    trailing stop modifications, rate retrieval, and economic calendar queries.
+    trailing stop modifications, rate retrieval, and account queries.
     """
     def __init__(self, symbol: str = "EURUSD", magic_number: int = 100888):
         self.symbol = symbol
@@ -96,11 +97,14 @@ class MT5Bridge:
         logger.info(f"Connected to MT5 Account #{self.account_login} on {self.server} (Equity: ${account_info.equity:,.2f})")
         return True
 
-    def get_account_equity(self) -> float:
+    def get_account_equity(self, fallback: float = 100000.0) -> float:
         if not self.connected:
-            return 100000.0
+            return fallback
         acc = mt5.account_info()
-        return float(acc.equity) if acc else 100000.0
+        if acc is not None and acc.equity > 0:
+            return float(acc.equity)
+        logger.warning("Failed to fetch live MT5 equity; using fallback value.")
+        return fallback
 
     def get_live_quote(self) -> Optional[Dict[str, float]]:
         if not self.connected:
@@ -230,8 +234,8 @@ class LiveExecutionEngine:
     - Computes real-time features and HMM market regimes.
     - Evaluates dual ML ensemble + Adaptive Conviction thresholds.
     - Prunes false breakouts using López de Prado Meta-Labeler.
-    - Sizes positions via Dynamic Inverse-Volatility Sizer.
-    - Enforces Spread Guard and Daily Drawdown circuit breakers.
+    - Sizes positions via Dynamic Inverse-Volatility Sizer synced to live broker equity.
+    - Enforces Spread Guard, Daily Drawdown, and Post-Stop-Loss cooldowns.
     - Manages trailing stops and time-decay exits.
     """
     def __init__(self, mode: str = "paper", config: ResearchConfig = default_config):
@@ -252,7 +256,12 @@ class LiveExecutionEngine:
 
         # 2. Institutional Phase 3 Engines
         self.macro_calendar = MacroNewsCalendar(pre_blackout_minutes=30, post_blackout_minutes=30)
-        self.adaptive_engine = AdaptiveThresholdEngine(base_percentile=99.0, base_margin=0.02, chop_percentile_boost=0.5, chop_margin_boost=0.015)
+        self.adaptive_engine = AdaptiveThresholdEngine(
+            base_percentile=99.0,
+            base_margin=0.02,
+            chop_percentile_boost=0.5,
+            chop_margin_boost=0.015
+        )
         self.dynamic_sizer = DynamicPositionSizer(base_risk_pct=config.max_risk_per_trade_pct)
         self.meta_labeler = MetaLabeler(random_state=config.random_seed)
 
@@ -266,10 +275,19 @@ class LiveExecutionEngine:
                 logger.warning("Falling back to PAPER mode because MT5 terminal connection failed.")
                 self.mode = "paper"
 
-        # 4. State & Safeguards
+        # 4. State & Safeguards (Synced with real broker equity in LIVE mode)
         self.active_trade: Optional[Dict[str, Any]] = None
-        self.equity = config.initial_capital
-        self.daily_start_equity = config.initial_capital
+        self.last_stop_loss_time: Optional[datetime] = None
+        self.stop_loss_cooldown_minutes: int = 15  # 3 M5 bars cooldown after SL
+
+        if self.mode == "live":
+            live_eq = self.mt5_bridge.get_account_equity(fallback=config.initial_capital)
+            self.equity = live_eq
+            self.daily_start_equity = live_eq
+        else:
+            self.equity = config.initial_capital
+            self.daily_start_equity = config.initial_capital
+
         self.daily_start_date = datetime.now(timezone.utc).date()
         self.circuit_breaker_active = False
 
@@ -281,8 +299,23 @@ class LiveExecutionEngine:
                 with open(self.state_file, "r") as f:
                     state = json.load(f)
                     self.active_trade = state.get("active_trade")
-                    self.equity = state.get("equity", self.config.initial_capital)
-                    self.daily_start_equity = state.get("daily_start_equity", self.equity)
+                    last_sl_str = state.get("last_stop_loss_time")
+                    if last_sl_str:
+                        self.last_stop_loss_time = datetime.fromisoformat(last_sl_str)
+
+                    if self.mode == "live":
+                        live_eq = self.mt5_bridge.get_account_equity(fallback=self.equity)
+                        self.equity = live_eq
+                        stored_daily = state.get("daily_start_equity", live_eq)
+                        # Guard against stale $100k baseline from earlier state files
+                        if stored_daily > live_eq * 1.5 or stored_daily < live_eq * 0.5:
+                            self.daily_start_equity = live_eq
+                        else:
+                            self.daily_start_equity = stored_daily
+                    else:
+                        self.equity = state.get("equity", self.config.initial_capital)
+                        self.daily_start_equity = state.get("daily_start_equity", self.equity)
+
                     self.circuit_breaker_active = state.get("circuit_breaker_active", False)
                     logger.info(f"Loaded existing execution state. Equity=${self.equity:,.2f} | Active Trade={bool(self.active_trade)}")
             except Exception as e:
@@ -295,6 +328,7 @@ class LiveExecutionEngine:
                 "daily_start_equity": self.daily_start_equity,
                 "circuit_breaker_active": self.circuit_breaker_active,
                 "active_trade": self.active_trade,
+                "last_stop_loss_time": self.last_stop_loss_time.isoformat() if self.last_stop_loss_time else None,
                 "last_update": datetime.now(timezone.utc).isoformat()
             }
             with open(self.state_file, "w") as f:
@@ -318,6 +352,9 @@ class LiveExecutionEngine:
         """
         Validates daily drawdown kill-switch and day reset.
         """
+        if self.mode == "live":
+            self.equity = self.mt5_bridge.get_account_equity(fallback=self.equity)
+
         today = datetime.now(timezone.utc).date()
         if today != self.daily_start_date:
             self.daily_start_date = today
@@ -384,7 +421,6 @@ class LiveExecutionEngine:
         current_regime_label = regime_report["regime_labels"].get(current_regime_id, "Unknown")
 
         # 5. Adaptive Thresholding
-        # Default baseline calibrated 99th percentile: 0.345
         base_cut = 0.345
         is_choppy = ("Range" in current_regime_label) or ("Mean-Reverting" in current_regime_label)
         long_cut = base_cut + (0.015 if is_choppy else 0.0)
@@ -408,7 +444,6 @@ class LiveExecutionEngine:
         final_signal = candidate_signal
         meta_decision = "PASS"
         if candidate_signal != 0:
-            # Check range expansion
             pip = self.config.pip_size
             current_bar_range = (ltf_df["high"].iloc[-1] - ltf_df["low"].iloc[-1]) / pip
             h = ltf_df["high"]
@@ -418,7 +453,6 @@ class LiveExecutionEngine:
             atr_pips = float(tr.tail(14).mean() / pip)
             range_ratio = current_bar_range / max(atr_pips, 1.0)
 
-            # Heuristic / model pruning
             if range_ratio > 2.8:  # Exhaustion spike
                 final_signal = 0
                 meta_decision = "PRUNED_EXHAUSTION_SPIKE"
@@ -441,6 +475,7 @@ class LiveExecutionEngine:
     def manage_position(self, current_close: float, current_high: float, current_low: float, current_atr_pips: float):
         """
         Manages active trade: Trailing stop to breakeven, news safeguard, TP, SL, and time decay.
+        Syncs post-close equity directly with MT5 in live mode.
         """
         if not self.active_trade:
             return
@@ -453,7 +488,7 @@ class LiveExecutionEngine:
         bars_held = self.active_trade.get("bars_held", 0) + 1
         self.active_trade["bars_held"] = bars_held
 
-        # 1. Macro News Safeguard: If upcoming Tier-1 event in <= 15 minutes, move stop to breakeven
+        # 1. Macro News Safeguard: Move stop to breakeven during Tier-1 window
         now_dt = pd.Timestamp(datetime.now(timezone.utc))
         is_news_blackout = bool(self.macro_calendar.compute_blackout_mask(pd.DatetimeIndex([now_dt])).iloc[0])
         if is_news_blackout:
@@ -520,12 +555,20 @@ class LiveExecutionEngine:
             pnl_pips = ((exit_price - entry_p) / pip) if d == 1 else ((entry_p - exit_price) / pip)
             comm_usd = self.config.commission_per_lot_usd * self.active_trade["lots"]
             net_pnl_usd = (pnl_pips * 10.0) * self.active_trade["lots"] - comm_usd
-            self.equity += net_pnl_usd
+
+            if self.mode == "live":
+                if self.active_trade.get("ticket"):
+                    self.mt5_bridge.close_position(self.active_trade["ticket"])
+                time.sleep(0.25)  # Allow broker balance to settle before reading equity
+                self.equity = self.mt5_bridge.get_account_equity(fallback=self.equity + net_pnl_usd)
+            else:
+                self.equity += net_pnl_usd
+
+            if reason == "STOP_LOSS":
+                self.last_stop_loss_time = datetime.now(timezone.utc)
+                logger.info(f"[COOLDOWN] Stop-loss hit. Pausing new entries for {self.stop_loss_cooldown_minutes} minutes.")
 
             logger.info(f"[{reason}] Position Closed: Direction={'BUY' if d==1 else 'SELL'} | Entry={entry_p:.5f} | Exit={exit_price:.5f} | Net PnL={pnl_pips:+.1f}p (${net_pnl_usd:+,.2f}) | Equity=${self.equity:,.2f}")
-
-            if self.mode == "live" and self.active_trade.get("ticket"):
-                self.mt5_bridge.close_position(self.active_trade["ticket"])
 
             trade_record = {
                 "entry_time": self.active_trade["entry_time"],
@@ -546,10 +589,17 @@ class LiveExecutionEngine:
     def execute_signal(self, signal: int, current_close: float, current_atr_pips: float, regime_label: str):
         """
         Executes order strictly on the new bar open (Sub-second next-bar latency).
-        Includes Spread Guard and Dynamic Volatility Sizing.
+        Includes Post-Stop-Loss Cooldown, Spread Guard, and Dynamic Volatility Sizing.
         """
         if self.active_trade is not None or signal == 0:
             return
+
+        # 0. Post-Stop-Loss Cooldown Check
+        if self.last_stop_loss_time is not None:
+            elapsed_min = (datetime.now(timezone.utc) - self.last_stop_loss_time).total_seconds() / 60.0
+            if elapsed_min < self.stop_loss_cooldown_minutes:
+                logger.info(f"[COOLDOWN ACTIVE] Skipping signal: {self.stop_loss_cooldown_minutes - elapsed_min:.1f} min remaining after stop-loss.")
+                return
 
         pip = self.config.pip_size
 
@@ -566,10 +616,12 @@ class LiveExecutionEngine:
         sl_dist_pips = max(current_atr_pips * self.config.atr_stop_mult, 8.0)
         tp_dist_pips = max(current_atr_pips * self.config.atr_take_profit_mult, 16.0)
 
-        # Dynamic Inverse-Volatility Position Sizing
-        current_equity = self.mt5_bridge.get_account_equity() if self.mode == "live" else self.equity
+        # Dynamic Inverse-Volatility Position Sizing synced with live MT5 equity
+        if self.mode == "live":
+            self.equity = self.mt5_bridge.get_account_equity(fallback=self.equity)
+
         lots = self.dynamic_sizer.calculate_lots(
-            equity=current_equity,
+            equity=self.equity,
             stop_loss_pips=sl_dist_pips,
             current_atr_pips=current_atr_pips,
             regime_label=regime_label
@@ -725,54 +777,28 @@ def run_verification_health_check() -> Dict[str, Any]:
     # 5. Circuit Breaker Simulation
     print("\n[CHECK 5: AUTOMATED CIRCUIT BREAKER AUDIT]")
     print(f"  > Spread Guard Limit:           1.5 pips (Enforced)")
-    print(f"  > Daily Max Drawdown Limit:     3.0% (Enforced)")
-    print(f"  > Max Trade Holding Time:       12 bars / 60 minutes (Enforced)")
-    print(f"  > Trailing Stop Threshold:      Breakeven + 1 pip at 50% TP distance (Enforced)")
+    print(f"  > Daily Drawdown Limit:         3.0% (Enforced)")
+    print(f"  > Post-Stop-Loss Cooldown:      15 minutes (Enforced)")
 
-    health_report = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "mt5_available": mt5_installed,
+    if mt5_connected:
+        bridge.disconnect()
+
+    return {
+        "mt5_installed": mt5_installed,
         "mt5_connected": mt5_connected,
-        "all_models_loaded": all_models_ok,
-        "macro_calendar_events_2026": len(events),
-        "cycle_execution_time_ms": round(cycle_time_ms, 2),
-        "circuit_breakers_active": True,
-        "production_ready": all_models_ok
+        "all_models_ok": all_models_ok,
+        "cycle_time_ms": round(cycle_time_ms, 1)
     }
-
-    report_path = REPORTS_DIR / "phase4_health_check_report.json"
-    with open(report_path, "w") as f:
-        json.dump(health_report, f, indent=4)
-
-    print("\n" + "=" * 78)
-    print(">>> PHASE 4 LIVE EXECUTION BRIDGE VERIFIED & PRODUCTION READY <<<")
-    print("=" * 78)
-    return health_report
-
-
-def main():
-    parser = argparse.ArgumentParser(description="ALPHA Capital Phase 4 Live & Paper Execution Bridge")
-    parser.add_argument("--mode", choices=["paper", "live"], default="paper", help="Execution mode (default: paper)")
-    parser.add_argument("--verify", action="store_true", help="Run complete verification health check suite")
-    parser.add_argument("--once", action="store_true", help="Execute single evaluation cycle and exit")
-    parser.add_argument("--interval", type=int, default=10, help="Polling loop interval in seconds (default: 10)")
-    args = parser.parse_args()
-
-    if args.verify:
-        run_verification_health_check()
-    elif args.once:
-        logger.info("Executing single test evaluation cycle...")
-        engine = LiveExecutionEngine(mode=args.mode)
-        loader = HistoricalDataLoader(default_config)
-        m1_df = loader.get_or_generate_m1_data(years=3)
-        resampler = MultiTimeframeResampler(default_config)
-        tf_data = resampler.resample_all(m1_df)
-        engine.run_cycle(tf_data["ltf"].tail(300), tf_data["mtf"].tail(150), tf_data["htf"].tail(100))
-        logger.info("Single evaluation cycle complete.")
-    else:
-        engine = LiveExecutionEngine(mode=args.mode)
-        engine.start_polling_loop(poll_interval_seconds=args.interval)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="ALPHA Capital Phase 4 Live Execution Engine")
+    parser.add_argument("--mode", type=str, default="paper", choices=["paper", "live", "verify"], help="Execution mode")
+    parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds")
+    args = parser.parse_args()
+
+    if args.mode == "verify":
+        run_verification_health_check()
+    else:
+        engine = LiveExecutionEngine(mode=args.mode)
+        engine.start_polling_loop(poll_interval_seconds=args.interval)
