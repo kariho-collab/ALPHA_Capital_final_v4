@@ -67,12 +67,39 @@ class MT5Bridge:
     Direct interface to MetaTrader 5 terminal for order placement,
     trailing stop modifications, rate retrieval, and account queries.
     """
-    def __init__(self, symbol: str = "EURUSD", magic_number: int = 100888):
+    def __init__(self, symbol: str = "EURUSD", magic_number: int = 100888, fallback_offset_hours: int = 2):
         self.symbol = symbol
         self.magic_number = magic_number
         self.connected = False
         self.account_login = 0
         self.server = ""
+        self.server_offset_hours = fallback_offset_hours
+
+    def detect_server_utc_offset(self) -> int:
+        """
+        Auto-detects the broker's MT5 server UTC offset (e.g. +2 or +3)
+        by comparing the latest live tick timestamp against true UTC.
+        """
+        if not self.connected:
+            return self.server_offset_hours
+
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None or tick.time <= 0:
+            return self.server_offset_hours
+
+        now_utc_ts = datetime.now(timezone.utc).timestamp()
+        diff_seconds = tick.time - now_utc_ts
+
+        # Only trust live ticks (ignore stale weekend ticks > 24 hours old)
+        if abs(diff_seconds) < 86400:
+            detected_offset = int(round(diff_seconds / 3600.0))
+            if detected_offset != self.server_offset_hours:
+                logger.info(f"Detected MT5 Broker Server Offset: UTC{detected_offset:+d} (Server: {self.server})")
+            self.server_offset_hours = detected_offset
+        else:
+            logger.warning(f"Market appears closed (stale tick). Using fallback offset UTC{self.server_offset_hours:+d}.")
+
+        return self.server_offset_hours
 
     def connect(self) -> bool:
         if not MT5_AVAILABLE:
@@ -94,7 +121,11 @@ class MT5Bridge:
         self.account_login = account_info.login
         self.server = account_info.server
         self.connected = True
-        logger.info(f"Connected to MT5 Account #{self.account_login} on {self.server} (Equity: ${account_info.equity:,.2f})")
+        self.detect_server_utc_offset()
+        logger.info(
+            f"Connected to MT5 Account #{self.account_login} on {self.server} "
+            f"(Equity: ${account_info.equity:,.2f} | Offset: UTC{self.server_offset_hours:+d})"
+        )
         return True
 
     def get_account_equity(self, fallback: float = 100000.0) -> float:
@@ -126,13 +157,15 @@ class MT5Bridge:
         rates = mt5.copy_rates_from_pos(self.symbol, timeframe_mt5, 0, n_bars)
         if rates is None or len(rates) == 0:
             return None
+
+        # Refresh offset dynamically in case a DST switch occurred while running
+        offset = self.detect_server_utc_offset()
+
         df = pd.DataFrame(rates)
-        # Synchronized with MT5 broker server time offset (-2 hours to UTC)
-        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True) - pd.Timedelta(hours=2)
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True) - pd.Timedelta(hours=offset)
         df.set_index('time', inplace=True)
         df.rename(columns={'tick_volume': 'volume'}, inplace=True)
         return df[['open', 'high', 'low', 'close', 'volume']]
-
     def send_order(
         self,
         direction: int,
