@@ -728,7 +728,8 @@ class LiveExecutionEngine:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ALPHA Capital Live Execution Engine")
     parser.add_argument("--mode", type=str, default="paper", choices=["paper", "live"], help="Execution mode")
+    parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds")
     args = parser.parse_args()
 
     engine = LiveExecutionEngine(mode=args.mode)
-    engine.start_polling_loop()
+    engine.start_polling_loop(poll_interval_seconds=args.interval)
