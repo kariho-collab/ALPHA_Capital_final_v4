@@ -1,8 +1,17 @@
 {
-  "equity": 50416.48,
+  "equity": 50416.41,
   "daily_start_equity": 50767.53,
   "circuit_breaker_active": false,
-  "active_trade": null,
+  "active_trade": {
+    "ticket": 19027923,
+    "entry_time": "2026-11-19T07:50:15.635422+00:00",
+    "direction": 1,
+    "entry_price": 1.09743,
+    "stop_loss": 1.09663,
+    "take_profit": 1.09903,
+    "lots": 4.63,
+    "bars_held": 0
+  },
   "last_stop_loss_time": "2026-11-18T15:35:05.395462+00:00",
-  "last_update": "2026-11-18T15:35:05.474114+00:00"
+  "last_update": "2026-11-19T07:50:15.636145+00:00"
 }

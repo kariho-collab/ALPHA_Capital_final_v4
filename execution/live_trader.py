@@ -65,39 +65,56 @@ except ImportError:
 class MT5Bridge:
     """
     Direct interface to MetaTrader 5 terminal for order placement,
-    trailing stop modifications, rate retrieval, and account queries.
+    trailing stop modifications, rate retrieval, UTC offset detection,
+    and account/position queries.
     """
-    def __init__(self, symbol: str = "EURUSD", magic_number: int = 100888, fallback_offset_hours: int = 2):
+    def __init__(
+        self,
+        symbol: str = "EURUSD",
+        magic_number: int = 100888,
+        fallback_offset_hours: int = 2,
+        max_fresh_tick_age_seconds: int = 300,
+    ):
         self.symbol = symbol
         self.magic_number = magic_number
         self.connected = False
         self.account_login = 0
         self.server = ""
         self.server_offset_hours = fallback_offset_hours
+        self.max_fresh_tick_age_seconds = max_fresh_tick_age_seconds
 
     def detect_server_utc_offset(self) -> int:
         """
         Auto-detects the broker's MT5 server UTC offset (e.g. +2 or +3)
         by comparing the latest live tick timestamp against true UTC.
+        Requires a fresh tick so stale rollover/weekend quotes or DST
+        boundary transitions do not skew the UTC offset.
         """
-        if not self.connected:
+        if not self.connected or not MT5_AVAILABLE:
             return self.server_offset_hours
 
         tick = mt5.symbol_info_tick(self.symbol)
-        if tick is None or tick.time <= 0:
+        if tick is None or getattr(tick, "time", 0) <= 0:
             return self.server_offset_hours
 
         now_utc_ts = datetime.now(timezone.utc).timestamp()
-        diff_seconds = tick.time - now_utc_ts
+        tick_time_ts = float(tick.time)
+        diff_seconds = tick_time_ts - now_utc_ts
+        tick_age_seconds = abs(now_utc_ts - tick_time_ts)
 
-        # Only trust live ticks (ignore stale weekend ticks > 24 hours old)
-        if abs(diff_seconds) < 86400:
+        if tick_age_seconds <= self.max_fresh_tick_age_seconds and abs(diff_seconds) < 86400:
             detected_offset = int(round(diff_seconds / 3600.0))
             if detected_offset != self.server_offset_hours:
-                logger.info(f"Detected MT5 Broker Server Offset: UTC{detected_offset:+d} (Server: {self.server})")
+                logger.info(
+                    f"Detected MT5 Broker Server Offset: UTC{detected_offset:+d} "
+                    f"(Server: {self.server}, tick_age={tick_age_seconds:.1f}s)"
+                )
             self.server_offset_hours = detected_offset
         else:
-            logger.warning(f"Market appears closed (stale tick). Using fallback offset UTC{self.server_offset_hours:+d}.")
+            logger.debug(
+                f"Tick age {tick_age_seconds:.1f}s exceeds {self.max_fresh_tick_age_seconds}s window; "
+                f"keeping offset UTC{self.server_offset_hours:+d}."
+            )
 
         return self.server_offset_hours
 
@@ -128,8 +145,16 @@ class MT5Bridge:
         )
         return True
 
+    def ensure_connected(self) -> bool:
+        if not MT5_AVAILABLE:
+            return False
+        if self.connected and mt5.terminal_info() is not None:
+            return True
+        self.connected = False
+        return self.connect()
+
     def get_account_equity(self, fallback: float = 100000.0) -> float:
-        if not self.connected:
+        if not self.connected or not MT5_AVAILABLE:
             return fallback
         acc = mt5.account_info()
         if acc is not None and acc.equity > 0:
@@ -138,7 +163,7 @@ class MT5Bridge:
         return fallback
 
     def get_live_quote(self) -> Optional[Dict[str, float]]:
-        if not self.connected:
+        if not self.connected or not MT5_AVAILABLE:
             return None
         tick = mt5.symbol_info_tick(self.symbol)
         if tick is None:
@@ -148,11 +173,11 @@ class MT5Bridge:
             "bid": float(tick.bid),
             "ask": float(tick.ask),
             "spread_pips": round(float(spread_pips), 2),
-            "time": tick.time
+            "time": float(tick.time)
         }
 
     def fetch_recent_bars(self, timeframe_mt5, n_bars: int = 300) -> Optional[pd.DataFrame]:
-        if not self.connected:
+        if not self.connected or not MT5_AVAILABLE:
             return None
         rates = mt5.copy_rates_from_pos(self.symbol, timeframe_mt5, 0, n_bars)
         if rates is None or len(rates) == 0:
@@ -166,6 +191,15 @@ class MT5Bridge:
         df.set_index('time', inplace=True)
         df.rename(columns={'tick_volume': 'volume'}, inplace=True)
         return df[['open', 'high', 'low', 'close', 'volume']]
+
+    def get_open_position_by_ticket(self, ticket: int):
+        if not self.connected or not MT5_AVAILABLE or not ticket:
+            return None
+        positions = mt5.positions_get(ticket=int(ticket))
+        if positions is None or len(positions) == 0:
+            return None
+        return positions[0]
+
     def send_order(
         self,
         direction: int,
@@ -174,7 +208,7 @@ class MT5Bridge:
         tp_price: float,
         slippage_pips: float = 0.5
     ) -> Optional[int]:
-        if not self.connected:
+        if not self.connected or not MT5_AVAILABLE:
             return None
 
         tick = mt5.symbol_info_tick(self.symbol)
@@ -205,20 +239,22 @@ class MT5Bridge:
             logger.error(f"MT5 order_send failed: {result.comment if result else mt5.last_error()}")
             return None
 
-        logger.info(f"MT5 Order Executed: Ticket #{result.order} | Direction={'BUY' if direction==1 else 'SELL'} | Lots={lots} | Price={price:.5f}")
+        logger.info(
+            f"MT5 Order Executed: Ticket #{result.order} | "
+            f"Direction={'BUY' if direction==1 else 'SELL'} | Lots={lots} | Price={price:.5f}"
+        )
         return result.order
 
     def modify_stop_loss(self, ticket: int, new_sl: float) -> bool:
-        if not self.connected:
+        if not self.connected or not MT5_AVAILABLE:
             return False
-        positions = mt5.positions_get(ticket=ticket)
-        if not positions or len(positions) == 0:
+        pos = self.get_open_position_by_ticket(int(ticket))
+        if pos is None:
             return False
 
-        pos = positions[0]
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
-            "position": ticket,
+            "position": int(ticket),
             "symbol": self.symbol,
             "sl": float(new_sl),
             "tp": float(pos.tp),
@@ -227,19 +263,22 @@ class MT5Bridge:
         return res is not None and res.retcode == mt5.TRADE_RETCODE_DONE
 
     def close_position(self, ticket: int) -> bool:
-        if not self.connected:
+        if not self.connected or not MT5_AVAILABLE:
             return False
-        positions = mt5.positions_get(ticket=ticket)
-        if not positions or len(positions) == 0:
+        p = self.get_open_position_by_ticket(int(ticket))
+        if p is None:
             return False
-        p = positions[0]
+
         tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            return False
+
         close_price = tick.bid if p.type == mt5.ORDER_TYPE_BUY else tick.ask
         close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "position": ticket,
+            "position": int(ticket),
             "symbol": self.symbol,
             "volume": float(p.volume),
             "type": close_type,
@@ -263,14 +302,14 @@ class MT5Bridge:
 class LiveExecutionEngine:
     """
     Phase 4 Production Execution Engine:
-- Ingests real-time 5-minute bar feeds.
-- Applies Tier-1 Macro News Blackout Protocol.
-- Computes real-time features and HMM market regimes.
-- Evaluates dual ML ensemble + Adaptive Conviction thresholds.
-- Prunes false breakouts using López de Prado Meta-Labeler.
-- Sizes positions via Dynamic Inverse-Volatility Sizer synced to live broker equity.
-- Enforces Spread Guard, Daily Drawdown, and Post-Stop-Loss cooldowns.
-- Manages trailing stops and time-decay exits.
+    - Ingests real-time 5-minute bar feeds (or cached historical paper feed).
+    - Applies Tier-1 Macro News Blackout Protocol.
+    - Computes real-time features and stabilized HMM market regimes.
+    - Evaluates dual ML ensemble + Adaptive Conviction thresholds.
+    - Prunes false breakouts using López de Prado Meta-Labeler.
+    - Sizes positions via Dynamic Inverse-Volatility Sizer synced to live broker equity.
+    - Enforces Spread Guard, Daily Drawdown, Post-Stop-Loss cooldowns, and MT5 state sync.
+    - Manages trailing stops and time-decay exits.
     """
     def __init__(self, mode: str = "paper", config: ResearchConfig = default_config):
         self.mode = mode.lower()
@@ -302,6 +341,13 @@ class LiveExecutionEngine:
         self.fe = MultiTimeframeFeatureEngineer(config)
         self.regime_detector = MarketRegimeDetector(n_states=config.hmm_states, random_state=config.random_seed)
 
+        # Cached HMM regime state to avoid unnecessary refit jitter per M5 bar
+        self._cached_regime_df: Optional[pd.DataFrame] = None
+        self._cached_regime_report: Optional[Dict[str, Any]] = None
+        self._cached_mtf_last_ts: Optional[pd.Timestamp] = None
+        self._mtf_bars_since_regime_refit: int = 24
+        self._regime_refit_interval_mtf_bars: int = 24
+
         # 3. Execution Bridge
         self.mt5_bridge = MT5Bridge(symbol=config.symbol)
         if self.mode == "live":
@@ -326,6 +372,8 @@ class LiveExecutionEngine:
         self.circuit_breaker_active = False
 
         self._load_state()
+        if self.mode == "live" and self.mt5_bridge.connected:
+            self.sync_active_trade_with_mt5()
 
     def _load_state(self):
         if self.state_file.exists():
@@ -351,7 +399,10 @@ class LiveExecutionEngine:
                         self.daily_start_equity = state.get("daily_start_equity", self.equity)
 
                     self.circuit_breaker_active = state.get("circuit_breaker_active", False)
-                    logger.info(f"Loaded existing execution state. Equity=${self.equity:,.2f} | Active Trade={bool(self.active_trade)}")
+                    logger.info(
+                        f"Loaded existing execution state. Equity=${self.equity:,.2f} | "
+                        f"Active Trade={bool(self.active_trade)}"
+                    )
             except Exception as e:
                 logger.warning(f"Could not load state: {e}")
 
@@ -382,6 +433,79 @@ class LiveExecutionEngine:
         with open(self.journal_file, "w") as f:
             json.dump(trades, f, indent=2)
 
+    def sync_active_trade_with_mt5(self):
+        """
+        Reconciles internal active_trade against live MT5 open positions so
+        broker-side SL/TP hits or manual closes do not leave stale state.
+        """
+        if self.mode != "live" or not self.mt5_bridge.connected or not self.active_trade:
+            return
+
+        ticket = self.active_trade.get("ticket")
+        if not ticket:
+            return
+
+        pos = self.mt5_bridge.get_open_position_by_ticket(int(ticket))
+        if pos is None:
+            logger.warning(
+                f"[STATE SYNC] MT5 ticket #{ticket} is no longer open on broker. "
+                f"Reconciling active_trade state and refreshing equity."
+            )
+            time.sleep(0.25)
+            prev_eq = self.equity
+            self.equity = self.mt5_bridge.get_account_equity(fallback=self.equity)
+            d = self.active_trade.get("direction", 1)
+            trade_record = {
+                "entry_time": self.active_trade.get("entry_time", datetime.now(timezone.utc).isoformat()),
+                "exit_time": datetime.now(timezone.utc).isoformat(),
+                "direction": "BUY" if d == 1 else "SELL",
+                "entry_price": self.active_trade.get("entry_price", 0.0),
+                "exit_price": 0.0,
+                "lots": self.active_trade.get("lots", 0.0),
+                "pnl_pips": 0.0,
+                "pnl_usd": round(self.equity - prev_eq, 2),
+                "exit_reason": "BROKER_CLOSED_OR_SLTP",
+                "equity_after": round(self.equity, 2),
+            }
+            self._log_trade(trade_record)
+            self.active_trade = None
+            self._save_state()
+
+    def _get_regime_classification(self, mtf_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Refits the HMM regime detector periodically on MTF bars rather than
+        re-fitting from scratch on every short rolling M5 update, while still
+        attaching current regime IDs when new MTF bars arrive.
+        """
+        latest_mtf_ts = pd.Timestamp(mtf_df.index[-1])
+        should_refit = (
+            self._cached_regime_df is None
+            or self._cached_regime_report is None
+            or self._mtf_bars_since_regime_refit >= self._regime_refit_interval_mtf_bars
+        )
+
+        if should_refit:
+            regime_df, regime_report = self.regime_detector.fit_and_predict(mtf_df)
+            self._cached_regime_df = regime_df
+            self._cached_regime_report = regime_report
+            self._cached_mtf_last_ts = latest_mtf_ts
+            self._mtf_bars_since_regime_refit = 0
+            return regime_df, regime_report
+
+        if self._cached_mtf_last_ts is None or latest_mtf_ts != self._cached_mtf_last_ts:
+            self._mtf_bars_since_regime_refit += 1
+            self._cached_mtf_last_ts = latest_mtf_ts
+
+        # Keep cached regime report and align series length/index cleanly if needed
+        cached_df = self._cached_regime_df
+        if len(cached_df) != len(mtf_df) or not cached_df.index.equals(mtf_df.index):
+            regime_df, regime_report = self.regime_detector.fit_and_predict(mtf_df)
+            self._cached_regime_df = regime_df
+            self._cached_regime_report = regime_report
+            return regime_df, regime_report
+
+        return cached_df, self._cached_regime_report
+
     def check_circuit_breakers(self) -> Tuple[bool, str]:
         """
         Validates daily drawdown kill-switch and day reset.
@@ -400,7 +524,11 @@ class LiveExecutionEngine:
         daily_loss_pct = (self.daily_start_equity - self.equity) / self.daily_start_equity * 100.0
         if daily_loss_pct >= 3.0:
             self.circuit_breaker_active = True
-            return False, f"DAILY DRAWDOWN KILL-SWITCH TRIGGERED: Loss {daily_loss_pct:.2f}% exceeds 3.0% daily limit. Trading locked until next UTC day."
+            return (
+                False,
+                f"DAILY DRAWDOWN KILL-SWITCH TRIGGERED: Loss {daily_loss_pct:.2f}% "
+                f"exceeds 3.0% daily limit. Trading locked until next UTC day."
+            )
 
         return True, "OK"
 
@@ -412,13 +540,17 @@ class LiveExecutionEngine:
     ) -> Tuple[int, Dict[str, Any]]:
         """
         Processes current market bars and evaluates Phase 3 signal generation:
-1. Tier-1 Macro News Blackout check
-2. HMM Market Regime classification
-3. Dual Ensemble predictions (Long + Short)
-4. Adaptive Volatility Thresholding
-5. López de Prado Meta-Labeler pruning
+        1. Tier-1 Macro News Blackout check
+        2. HMM Market Regime classification
+        3. Dual Ensemble predictions (Long + Short)
+        4. Adaptive Volatility Thresholding
+        5. López de Prado Meta-Labeler pruning
         """
-        current_time = pd.Timestamp(ltf_df.index[-1], tz="UTC") if ltf_df.index[-1].tzinfo is None else ltf_df.index[-1]
+        current_time = (
+            pd.Timestamp(ltf_df.index[-1], tz="UTC")
+            if ltf_df.index[-1].tzinfo is None
+            else ltf_df.index[-1]
+        )
 
         # 1. Macro News Blackout Check (US CPI, NFP, FOMC, ECB)
         mask = self.macro_calendar.compute_blackout_mask(pd.DatetimeIndex([current_time]))
@@ -432,8 +564,8 @@ class LiveExecutionEngine:
             logger.info(f"[NEWS BLACKOUT] {diag['message']}")
             return 0, diag
 
-        # 2. HMM Regime Classification
-        regime_df, regime_report = self.regime_detector.fit_and_predict(mtf_df)
+        # 2. HMM Regime Classification (cached with periodic MTF refit)
+        regime_df, regime_report = self._get_regime_classification(mtf_df)
 
         # 3. Feature Extraction
         proc_df, feature_cols = self.fe.extract_features(ltf_df, mtf_df, htf_df, regime_df)
@@ -443,13 +575,17 @@ class LiveExecutionEngine:
         latest_features = proc_df[feature_cols].iloc[[-1]].values
 
         # 4. Dual ML Ensemble Predictions
-        p_l = float(0.40 * self.xgb_l.predict_proba(latest_features)[:, 1][0] +
-                    0.40 * self.lgb_l.predict_proba(latest_features)[:, 1][0] +
-                    0.20 * self.rf_l.predict_proba(latest_features)[:, 1][0])
+        p_l = float(
+            0.40 * self.xgb_l.predict_proba(latest_features)[:, 1][0] +
+            0.40 * self.lgb_l.predict_proba(latest_features)[:, 1][0] +
+            0.20 * self.rf_l.predict_proba(latest_features)[:, 1][0]
+        )
 
-        p_s = float(0.40 * self.xgb_s.predict_proba(latest_features)[:, 1][0] +
-                    0.40 * self.lgb_s.predict_proba(latest_features)[:, 1][0] +
-                    0.20 * self.rf_s.predict_proba(latest_features)[:, 1][0])
+        p_s = float(
+            0.40 * self.xgb_s.predict_proba(latest_features)[:, 1][0] +
+            0.40 * self.lgb_s.predict_proba(latest_features)[:, 1][0] +
+            0.20 * self.rf_s.predict_proba(latest_features)[:, 1][0]
+        )
 
         current_regime_id = int(proc_df["regime_id"].iloc[-1]) if "regime_id" in proc_df.columns else 0
         current_regime_label = regime_report["regime_labels"].get(current_regime_id, "Unknown")
@@ -490,7 +626,10 @@ class LiveExecutionEngine:
             if range_ratio > 2.8:  # Exhaustion spike
                 final_signal = 0
                 meta_decision = "PRUNED_EXHAUSTION_SPIKE"
-                logger.info(f"[META-LABELER] Signal {candidate_signal} pruned: Bar range {current_bar_range:.1f}p exceeds ATR exhaustion limit.")
+                logger.info(
+                    f"[META-LABELER] Signal {candidate_signal} pruned: "
+                    f"Bar range {current_bar_range:.1f}p exceeds ATR exhaustion limit."
+                )
 
         diag = {
             "timestamp": str(proc_df.index[-1]),
@@ -600,9 +739,16 @@ class LiveExecutionEngine:
 
             if reason == "STOP_LOSS":
                 self.last_stop_loss_time = datetime.now(timezone.utc)
-                logger.info(f"[COOLDOWN] Stop-loss hit. Pausing new entries for {self.stop_loss_cooldown_minutes} minutes.")
+                logger.info(
+                    f"[COOLDOWN] Stop-loss hit. Pausing new entries for "
+                    f"{self.stop_loss_cooldown_minutes} minutes."
+                )
 
-            logger.info(f"[{reason}] Position Closed: Direction={'BUY' if d==1 else 'SELL'} | Entry={entry_p:.5f} | Exit={exit_price:.5f} | Net PnL={pnl_pips:+.1f}p (${net_pnl_usd:+,.2f}) | Equity=${self.equity:,.2f}")
+            logger.info(
+                f"[{reason}] Position Closed: Direction={'BUY' if d==1 else 'SELL'} | "
+                f"Entry={entry_p:.5f} | Exit={exit_price:.5f} | "
+                f"Net PnL={pnl_pips:+.1f}p (${net_pnl_usd:+,.2f}) | Equity=${self.equity:,.2f}"
+            )
 
             trade_record = {
                 "entry_time": self.active_trade["entry_time"],
@@ -632,7 +778,10 @@ class LiveExecutionEngine:
         if self.last_stop_loss_time is not None:
             elapsed_min = (datetime.now(timezone.utc) - self.last_stop_loss_time).total_seconds() / 60.0
             if elapsed_min < self.stop_loss_cooldown_minutes:
-                logger.info(f"[COOLDOWN ACTIVE] Skipping signal: {self.stop_loss_cooldown_minutes - elapsed_min:.1f} min remaining after stop-loss.")
+                logger.info(
+                    f"[COOLDOWN ACTIVE] Skipping signal: "
+                    f"{self.stop_loss_cooldown_minutes - elapsed_min:.1f} min remaining after stop-loss."
+                )
                 return
 
         pip = self.config.pip_size
@@ -641,7 +790,10 @@ class LiveExecutionEngine:
         live_quote = self.mt5_bridge.get_live_quote()
         spread_pips = live_quote["spread_pips"] if live_quote else self.config.typical_spread_pips
         if spread_pips > 1.5:
-            logger.warning(f"[SPREAD GUARD] Live broker spread ({spread_pips:.1f} pips) exceeds 1.5 pip threshold. Entry aborted.")
+            logger.warning(
+                f"[SPREAD GUARD] Live broker spread ({spread_pips:.1f} pips) "
+                f"exceeds 1.5 pip threshold. Entry aborted."
+            )
             return
 
         cost_price = (spread_pips + self.config.slippage_pips) * pip
@@ -662,11 +814,19 @@ class LiveExecutionEngine:
         )
 
         if signal == 1:
-            entry_p = (live_quote["ask"] + self.config.slippage_pips * pip) if live_quote else (current_close + cost_price)
+            entry_p = (
+                (live_quote["ask"] + self.config.slippage_pips * pip)
+                if live_quote
+                else (current_close + cost_price)
+            )
             sl_p = entry_p - (sl_dist_pips * pip)
             tp_p = entry_p + (tp_dist_pips * pip)
         else:
-            entry_p = (live_quote["bid"] - self.config.slippage_pips * pip) if live_quote else (current_close - cost_price)
+            entry_p = (
+                (live_quote["bid"] - self.config.slippage_pips * pip)
+                if live_quote
+                else (current_close - cost_price)
+            )
             sl_p = entry_p + (sl_dist_pips * pip)
             tp_p = entry_p - (tp_dist_pips * pip)
 
@@ -688,7 +848,10 @@ class LiveExecutionEngine:
             "bars_held": 0
         }
         self._save_state()
-        logger.info(f"[SIGNAL EXECUTED] Entered {'BUY' if signal==1 else 'SELL'} | Lots={lots:.2f} | Entry={entry_p:.5f} | SL={sl_p:.5f} | TP={tp_p:.5f} | Spread={spread_pips:.1f}p")
+        logger.info(
+            f"[SIGNAL EXECUTED] Entered {'BUY' if signal==1 else 'SELL'} | Lots={lots:.2f} | "
+            f"Entry={entry_p:.5f} | SL={sl_p:.5f} | TP={tp_p:.5f} | Spread={spread_pips:.1f}p"
+        )
 
     def run_cycle(self, ltf_df: pd.DataFrame, mtf_df: pd.DataFrame, htf_df: pd.DataFrame):
         """
@@ -698,6 +861,8 @@ class LiveExecutionEngine:
         if not ok:
             logger.error(msg)
             return
+
+        self.sync_active_trade_with_mt5()
 
         current_close = float(ltf_df["close"].iloc[-1])
         current_high = float(ltf_df["high"].iloc[-1])
@@ -715,7 +880,11 @@ class LiveExecutionEngine:
 
         # 2. Evaluate new signal
         signal, diag = self.evaluate_live_signal(ltf_df, mtf_df, htf_df)
-        logger.info(f"[BAR POLL] {diag.get('timestamp', 'N/A')} | Close={current_close:.5f} | Regime={diag.get('regime_label', 'N/A')} | P(L)={diag.get('p_long', 0):.4f} | P(S)={diag.get('p_short', 0):.4f} | Edge={diag.get('edge', 0):+.4f} | Signal={signal}")
+        logger.info(
+            f"[BAR POLL] {diag.get('timestamp', 'N/A')} | Close={current_close:.5f} | "
+            f"Regime={diag.get('regime_label', 'N/A')} | P(L)={diag.get('p_long', 0):.4f} | "
+            f"P(S)={diag.get('p_short', 0):.4f} | Edge={diag.get('edge', 0):+.4f} | Signal={signal}"
+        )
 
         # 3. Enter new position if flat
         if self.active_trade is None and signal != 0:
@@ -725,44 +894,86 @@ class LiveExecutionEngine:
     def start_polling_loop(self, poll_interval_seconds: int = 10):
         """
         Continuous bar polling loop enforcing sub-second next-bar open execution.
+        Caches historical paper/fallback resampled bars before entering the loop.
         """
-        logger.info(f"Starting ALPHA Capital Live Execution Loop in [{self.mode.upper()}] mode (Poll Interval={poll_interval_seconds}s)...")
+        logger.info(
+            f"Starting ALPHA Capital Live Execution Loop in [{self.mode.upper()}] mode "
+            f"(Poll Interval={poll_interval_seconds}s)..."
+        )
         last_polled_bar_time = None
+
+        paper_ltf = None
+        paper_mtf = None
+        paper_htf = None
+
+        if not (self.mode == "live" and self.mt5_bridge.connected):
+            loader = HistoricalDataLoader(self.config)
+            m1_df = loader.get_or_generate_m1_data(years=3)
+            resampler = MultiTimeframeResampler(self.config)
+            tf_data = resampler.resample_all(m1_df)
+            paper_ltf = tf_data["ltf"].tail(300)
+            paper_mtf = (tf_data["tf"] if "tf" in tf_data else tf_data["mtf"]).tail(150)
+            paper_htf = tf_data["htf"].tail(100)
 
         try:
             while True:
-                if self.mode == "live" and self.mt5_bridge.connected:
+                time.sleep(poll_interval_seconds)
+
+                if self.mode == "live":
+                    if not self.mt5_bridge.ensure_connected():
+                        logger.warning("MT5 connection lost during live loop; skipping cycle.")
+                        continue
+
                     ltf_df = self.mt5_bridge.fetch_recent_bars(mt5.TIMEFRAME_M5, n_bars=300)
                     mtf_df = self.mt5_bridge.fetch_recent_bars(mt5.TIMEFRAME_H1, n_bars=150)
                     htf_df = self.mt5_bridge.fetch_recent_bars(mt5.TIMEFRAME_D1, n_bars=100)
+
+                    if ltf_df is None or mtf_df is None or htf_df is None:
+                        logger.warning("Incomplete MT5 bar fetch; skipping cycle.")
+                        continue
                 else:
-                    loader = HistoricalDataLoader(self.config)
-                    m1_df = loader.get_or_generate_m1_data(years=3)
-                    resampler = MultiTimeframeResampler(self.config)
-                    tf_data = resampler.resample_all(m1_df)
-                    ltf_df = tf_data["ltf"].tail(300)
-                    mtf_df = tf_data["tf"].tail(150) if "tf" in tf_data else tf_data["mtf"].tail(150)
-                    htf_df = tf_data["htf"].tail(100)
+                    ltf_df = paper_ltf
+                    mtf_df = paper_mtf
+                    htf_df = paper_htf
 
-                if ltf_df is not None and len(ltf_df) > 0:
-                    current_bar_time = ltf_df.index[-1]
-                    if current_bar_time != last_polled_bar_time:
-                        last_polled_bar_time = current_bar_time
-                        self.run_cycle(ltf_df, mtf_df, htf_df)
+                if ltf_df is None or len(ltf_df) == 0:
+                    continue
 
-                time.sleep(poll_interval_seconds)
+                current_bar_time = ltf_df.index[-1]
+                if current_bar_time != last_polled_bar_time:
+                    last_polled_bar_time = current_bar_time
+                    self.run_cycle(ltf_df, mtf_df, htf_df)
+
         except KeyboardInterrupt:
-            logger.info("Live execution loop interrupted by operator. Disconnecting...")
+            logger.info("Polling loop stopped by user (KeyboardInterrupt).")
         finally:
-            if self.mode == "live":
+            if self.mode == "live" and self.mt5_bridge.connected:
                 self.mt5_bridge.disconnect()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ALPHA Capital Live Execution Engine")
-    parser.add_argument("--mode", type=str, default="paper", choices=["paper", "live"], help="Execution mode")
-    parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds")
-    args = parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ALPHA Capital Live & Paper Execution Bridge")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="paper",
+        choices=["paper", "live"],
+        help="Execution mode: 'paper' or 'live' (default: paper)"
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=10,
+        help="Polling interval in seconds between bar checks (default: 10)"
+    )
+    return parser.parse_args()
 
-    engine = LiveExecutionEngine(mode=args.mode)
-    engine.start_polling_loop(poll_interval_seconds=args.interval)
+
+def main():
+    args = parse_args()
+    engine = LiveExecutionEngine(mode=args.mode, config=default_config)
+    engine.start_polling_loop(poll_interval_seconds=max(1, args.interval))
+
+
+if __name__ == "__main__":
+    main()
