@@ -20,6 +20,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import sys
 import time
@@ -66,7 +67,7 @@ class MT5Bridge:
     """
     Direct interface to MetaTrader 5 terminal for order placement,
     trailing stop modifications, rate retrieval, UTC offset detection,
-    and account/position queries.
+    and account/position/deal history queries.
     """
     def __init__(
         self,
@@ -112,7 +113,7 @@ class MT5Bridge:
             self.server_offset_hours = detected_offset
         else:
             logger.debug(
-                f"Tick age {tick_age_seconds:.1f}s exceeds {self.max_fresh_tick_age_seconds}s window; "
+                f"Tick age {tick_age_seconds:.1f}s exceeds {self.max_fresh_tick_age_seconds}s freshness window; "
                 f"keeping offset UTC{self.server_offset_hours:+d}."
             )
 
@@ -199,6 +200,33 @@ class MT5Bridge:
         if positions is None or len(positions) == 0:
             return None
         return positions[0]
+
+    def get_closing_deal_info(self, ticket: int) -> Optional[Dict[str, float]]:
+        """
+        Queries MT5 deal history for a closed position ticket so broker-side
+        SL/TP or manual closes record accurate exit price and net PnL.
+        """
+        if not self.connected or not MT5_AVAILABLE or not ticket:
+            return None
+
+        deals = mt5.history_deals_get(position=int(ticket))
+        if deals is None or len(deals) == 0:
+            return None
+
+        deal_out_flag = getattr(mt5, "DEAL_ENTRY_OUT", 1)
+        exit_deals = [d for d in deals if getattr(d, "entry", None) == deal_out_flag]
+        if not exit_deals:
+            return None
+
+        last_deal = exit_deals[-1]
+        profit = float(getattr(last_deal, "profit", 0.0))
+        swap = float(getattr(last_deal, "swap", 0.0))
+        commission = float(getattr(last_deal, "commission", 0.0))
+
+        return {
+            "exit_price": float(getattr(last_deal, "price", 0.0)),
+            "pnl_usd": round(profit + swap + commission, 2),
+        }
 
     def send_order(
         self,
@@ -375,10 +403,17 @@ class LiveExecutionEngine:
         if self.mode == "live" and self.mt5_bridge.connected:
             self.sync_active_trade_with_mt5()
 
+    def _atomic_write_json(self, target_path: Path, payload: Any):
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, target_path)
+
     def _load_state(self):
         if self.state_file.exists():
             try:
-                with open(self.state_file, "r") as f:
+                with open(self.state_file, "r", encoding="utf-8") as f:
                     state = json.load(f)
                     self.active_trade = state.get("active_trade")
                     last_sl_str = state.get("last_stop_loss_time")
@@ -416,8 +451,7 @@ class LiveExecutionEngine:
                 "last_stop_loss_time": self.last_stop_loss_time.isoformat() if self.last_stop_loss_time else None,
                 "last_update": datetime.now(timezone.utc).isoformat()
             }
-            with open(self.state_file, "w") as f:
-                json.dump(state, f, indent=2)
+            self._atomic_write_json(self.state_file, state)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
@@ -425,18 +459,18 @@ class LiveExecutionEngine:
         trades = []
         if self.journal_file.exists():
             try:
-                with open(self.journal_file, "r") as f:
+                with open(self.journal_file, "r", encoding="utf-8") as f:
                     trades = json.load(f)
             except Exception:
                 trades = []
         trades.append(trade_data)
-        with open(self.journal_file, "w") as f:
-            json.dump(trades, f, indent=2)
+        self._atomic_write_json(self.journal_file, trades)
 
-    def sync_active_trade_with_mt5(self):
+    def sync_active_trade_with_mt5(self, prior_equity: Optional[float] = None):
         """
         Reconciles internal active_trade against live MT5 open positions so
-        broker-side SL/TP hits or manual closes do not leave stale state.
+        broker-side SL/TP hits or manual closes do not leave stale state,
+        and populates exit_price, pnl_pips, and pnl_usd from deal history.
         """
         if self.mode != "live" or not self.mt5_bridge.connected or not self.active_trade:
             return
@@ -452,18 +486,38 @@ class LiveExecutionEngine:
                 f"Reconciling active_trade state and refreshing equity."
             )
             time.sleep(0.25)
-            prev_eq = self.equity
+            prev_eq = prior_equity if prior_equity is not None else self.equity
             self.equity = self.mt5_bridge.get_account_equity(fallback=self.equity)
+
             d = self.active_trade.get("direction", 1)
+            entry_p = float(self.active_trade.get("entry_price", 0.0))
+            pip = self.config.pip_size
+
+            deal_info = self.mt5_bridge.get_closing_deal_info(int(ticket))
+            if deal_info and deal_info.get("exit_price", 0.0) > 0:
+                exit_price = float(deal_info["exit_price"])
+                pnl_pips = round(
+                    ((exit_price - entry_p) / pip) if d == 1 else ((entry_p - exit_price) / pip),
+                    1
+                )
+                pnl_usd = round(float(deal_info["pnl_usd"]), 2)
+            else:
+                exit_price = 0.0
+                pnl_pips = 0.0
+                pnl_usd = round(self.equity - prev_eq, 2)
+
+            if pnl_usd < 0:
+                self.last_stop_loss_time = datetime.now(timezone.utc)
+
             trade_record = {
                 "entry_time": self.active_trade.get("entry_time", datetime.now(timezone.utc).isoformat()),
                 "exit_time": datetime.now(timezone.utc).isoformat(),
                 "direction": "BUY" if d == 1 else "SELL",
-                "entry_price": self.active_trade.get("entry_price", 0.0),
-                "exit_price": 0.0,
+                "entry_price": entry_p,
+                "exit_price": exit_price,
                 "lots": self.active_trade.get("lots", 0.0),
-                "pnl_pips": 0.0,
-                "pnl_usd": round(self.equity - prev_eq, 2),
+                "pnl_pips": pnl_pips,
+                "pnl_usd": pnl_usd,
                 "exit_reason": "BROKER_CLOSED_OR_SLTP",
                 "equity_after": round(self.equity, 2),
             }
@@ -496,7 +550,6 @@ class LiveExecutionEngine:
             self._mtf_bars_since_regime_refit += 1
             self._cached_mtf_last_ts = latest_mtf_ts
 
-        # Keep cached regime report and align series length/index cleanly if needed
         cached_df = self._cached_regime_df
         if len(cached_df) != len(mtf_df) or not cached_df.index.equals(mtf_df.index):
             regime_df, regime_report = self.regime_detector.fit_and_predict(mtf_df)
@@ -857,12 +910,13 @@ class LiveExecutionEngine:
         """
         Executes a single bar evaluation cycle.
         """
+        prior_eq = self.equity
         ok, msg = self.check_circuit_breakers()
         if not ok:
             logger.error(msg)
             return
 
-        self.sync_active_trade_with_mt5()
+        self.sync_active_trade_with_mt5(prior_equity=prior_eq)
 
         current_close = float(ltf_df["close"].iloc[-1])
         current_high = float(ltf_df["high"].iloc[-1])
